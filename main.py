@@ -94,6 +94,9 @@ class DebouncePlugin(Star):
         # 正在等待 LLM 回复的会话集合
         self.pending_llm_sessions: set = set()
         
+        # 需要丢弃回复的会话集合
+        self.discard_responses: set = set()
+        
         # 插件目录
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         
@@ -222,15 +225,17 @@ class DebouncePlugin(Star):
         # 检查该会话是否正在等待 LLM 回复
         if cancel_on_new and session_id in self.pending_llm_sessions:
             # 用户在等待回复时又发了新消息，说明想补充内容
+            # 标记需要丢弃旧回复
+            self.discard_responses.add(session_id)
+            
+            # 将新消息加入缓冲区
             buffer.add(message_text)
-            self.pending_llm_sessions.discard(session_id)  # 取消待处理标记
             
             if debug_mode:
-                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已取消回复并缓存: {message_text}")
+                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已标记丢弃旧回复，缓存新消息: {message_text}")
             
-            # 阻止这次 LLM 请求
-            event.stop_event()
-            return
+            # 注意：不调用 stop_event()，让新消息继续正常的防抖流程
+            # 继续往下执行，重新判断完整性
         
         # 检查是否超时
         if buffer.messages and buffer.is_timeout(timeout_seconds):
@@ -246,8 +251,10 @@ class DebouncePlugin(Star):
                 logger.info(f"[防抖] 超时发送: {full_text}")
             return
         
-        # 添加新消息到缓冲区
-        buffer.add(message_text)
+        # 如果正在等待旧回复，先不添加新消息（已在上面添加过）
+        if not (cancel_on_new and session_id in self.pending_llm_sessions):
+            # 添加新消息到缓冲区
+            buffer.add(message_text)
         full_text = buffer.get_full_text()
         
         # 模型预测
@@ -281,13 +288,26 @@ class DebouncePlugin(Star):
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp):
-        """LLM 回复后的钩子 - 清除待处理标记"""
+        """LLM 回复后的钩子 - 检查是否需要丢弃回复"""
         session_id = event.message_obj.session_id
+        debug_mode = self._get_config("debug_mode", False)
+        
+        # 检查是否需要丢弃这个回复
+        if session_id in self.discard_responses:
+            self.discard_responses.discard(session_id)
+            self.pending_llm_sessions.discard(session_id)
+            
+            if debug_mode:
+                logger.info(f"[防抖] 已丢弃过时的 LLM 回复")
+            
+            # 阻止回复发送 - 清空响应内容
+            if hasattr(resp, 'completion_text'):
+                resp.completion_text = ""
+            return
         
         # 清除待处理标记
         self.pending_llm_sessions.discard(session_id)
         
-        debug_mode = self._get_config("debug_mode", False)
         if debug_mode:
             logger.info(f"[防抖] LLM 回复完成，清除会话 {session_id} 的待处理标记")
     
@@ -322,5 +342,6 @@ class DebouncePlugin(Star):
         
         self.buffers.clear()
         self.pending_llm_sessions.clear()
+        self.discard_responses.clear()
         self.classifier = None
         logger.info("🛑 消息防抖插件已卸载")
