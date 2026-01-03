@@ -1,0 +1,33 @@
+{
+    "model_type": {
+        "type": "string",
+        "description": "选择使用的模型类型",
+        "options": ["small", "normal"],
+        "default": "small",
+        "hint": "small: 轻量模型，速度快 | normal: 标准模型，准确度更高"
+    },
+    "send_threshold": {
+        "type": "float",
+        "description": "判断句子完整的概率阈值",
+        "default": 0.5,
+        "hint": "取值范围 0-1，越高则越严格（需要更高的完整概率才会发送）"
+    },
+    "timeout_seconds": {
+        "type": "int",
+        "description": "消息缓存超时时间（秒）",
+        "default": 30,
+        "hint": "超过此时间后，即使句子未完整也会自动发送。设为 0 表示不超时"
+    },
+    "enabled": {
+        "type": "bool",
+        "description": "是否启用消息防抖功能",
+        "default": true,
+        "hint": "关闭后插件将不拦截任何消息"
+    },
+    "debug_mode": {
+        "type": "bool",
+        "description": "调试模式",
+        "default": false,
+        "hint": "开启后会在日志中输出详细的推理信息"
+    }
+}
