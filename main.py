@@ -97,6 +97,12 @@ class DebouncePlugin(Star):
         # 需要丢弃回复的会话集合
         self.discard_responses: set = set()
         
+        # 记录上次发送的消息内容（用于恢复）
+        self.last_sent_messages: Dict[str, str] = {}
+        
+        # 正在等待的会话集合（防止重复等待）
+        self.waiting_sessions: set = set()
+        
         # 插件目录
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         
@@ -228,27 +234,25 @@ class DebouncePlugin(Star):
             # 标记需要丢弃旧回复
             self.discard_responses.add(session_id)
             
+            # 恢复上次发送的消息到缓冲区
+            if session_id in self.last_sent_messages:
+                buffer.messages = [self.last_sent_messages[session_id]]
+            
             # 将新消息加入缓冲区
             buffer.add(message_text)
             
             if debug_mode:
-                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已标记丢弃旧回复，缓存新消息: {message_text}")
+                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已恢复上次消息并合并: {buffer.get_full_text()}")
             
             # 注意：不调用 stop_event()，让新消息继续正常的防抖流程
             # 继续往下执行，重新判断完整性
-        
-        # 检查是否超时
-        if buffer.messages and buffer.is_timeout(timeout_seconds):
-            # 超时，合并已有消息并发送
-            full_text = buffer.get_full_text() + " " + message_text
-            buffer.clear()
-            
-            # 修改请求内容为完整消息
-            if hasattr(req, 'prompt') and req.prompt:
-                req.prompt = full_text
+        elif session_id in self.waiting_sessions:
+            # 已有其他消息在等待中，只添加到缓存
+            buffer.add(message_text)
+            event.stop_event()
             
             if debug_mode:
-                logger.info(f"[防抖] 超时发送: {full_text}")
+                logger.info(f"[防抖] 检测到正在等待中，添加到缓存: {buffer.get_full_text()}")
             return
         
         # 如果正在等待旧回复，先不添加新消息（已在上面添加过）
@@ -265,7 +269,8 @@ class DebouncePlugin(Star):
             logger.info(f"[防抖] 文本: '{full_text}' | 完整概率: {score_send:.4f} | 判定: {'发送' if is_complete else '等待'}")
         
         if is_complete:
-            # 句子完整，清空缓冲区并发送
+            # 句子完整，记录要发送的内容并清空缓冲区
+            self.last_sent_messages[session_id] = full_text
             buffer.clear()
             
             # 如果启用了取消功能，标记该会话正在等待 LLM 回复
@@ -280,11 +285,68 @@ class DebouncePlugin(Star):
             if debug_mode:
                 logger.info(f"[防抖] 完整发送: {full_text}")
         else:
-            # 句子未完整，阻止请求，停止事件传播
-            event.stop_event()
-            
+            # 句子未完整，进入等待循环
             if debug_mode:
-                logger.info(f"[防抖] 等待更多输入，当前缓存: {full_text}")
+                logger.info(f"[防抖] 句子未完整，进入等待: {full_text}")
+            
+            # 标记该会话正在等待
+            self.waiting_sessions.add(session_id)
+            initial_update_time = buffer.last_update
+            
+            try:
+                # 循环等待直到超时或有新消息
+                while True:
+                    await asyncio.sleep(1)  # 每秒检查一次
+                    
+                    # 检查是否有新消息到来
+                    if buffer.last_update > initial_update_time:
+                        # 有新消息，重新判断完整性
+                        full_text = buffer.get_full_text()
+                        score_send, _ = self.classifier.predict(full_text)
+                        is_complete = score_send >= threshold
+                        
+                        if debug_mode:
+                            logger.info(f"[防抖] 检测到新消息，重新判断: '{full_text}' | 完整概率: {score_send:.4f} | 判定: {'发送' if is_complete else '等待'}")
+                        
+                        if is_complete:
+                            # 现在完整了，发送
+                            self.last_sent_messages[session_id] = full_text
+                            buffer.clear()
+                            
+                            # 标记等待 LLM 回复
+                            if cancel_on_new:
+                                self.pending_llm_sessions.add(session_id)
+                            
+                            # 修改请求内容为完整消息
+                            if hasattr(req, 'prompt') and req.prompt:
+                                req.prompt = full_text
+                            
+                            if debug_mode:
+                                logger.info(f"[防抖] 等待期间变完整，发送: {full_text}")
+                            
+                            return  # 不调用 stop_event()，允许请求继续
+                        else:
+                            # 还是不完整，更新时间，继续等待
+                            initial_update_time = buffer.last_update
+                    
+                    # 检查是否超时
+                    if buffer.is_timeout(timeout_seconds):
+                        # 超时，发送当前缓存的内容
+                        full_text = buffer.get_full_text()
+                        buffer.clear()
+                        
+                        # 修改请求内容为缓存消息
+                        if hasattr(req, 'prompt') and req.prompt:
+                            req.prompt = full_text
+                        
+                        if debug_mode:
+                            logger.info(f"[防抖] 等待超时，发送: {full_text}")
+                        
+                        return  # 不调用 stop_event()，允许请求继续
+            
+            finally:
+                # 确保清除等待标记
+                self.waiting_sessions.discard(session_id)
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp):
@@ -308,23 +370,25 @@ class DebouncePlugin(Star):
         # 清除待处理标记
         self.pending_llm_sessions.discard(session_id)
         
+        # 清除已发送消息的记录
+        self.last_sent_messages.pop(session_id, None)
+        
         if debug_mode:
             logger.info(f"[防抖] LLM 回复完成，清除会话 {session_id} 的待处理标记")
     
     async def _timeout_checker(self):
-        """后台任务：定期检查并清理超时的缓冲区"""
+        """后台任务：定期清理过期的缓冲区"""
         while True:
-            await asyncio.sleep(10)  # 每10秒检查一次
+            await asyncio.sleep(60)  # 每分钟检查一次
             
             timeout_seconds = self._get_config("timeout_seconds", 30)
             if timeout_seconds <= 0:
                 continue
             
-            # 清理超时的缓冲区
+            # 清理过期的缓冲区（超过3倍超时时间）
             expired_sessions = []
             for session_id, buffer in self.buffers.items():
-                if buffer.messages and buffer.is_timeout(timeout_seconds * 2):
-                    # 超过2倍超时时间的缓冲区直接清理
+                if buffer.messages and buffer.is_timeout(timeout_seconds * 3):
                     expired_sessions.append(session_id)
             
             for session_id in expired_sessions:
@@ -343,5 +407,7 @@ class DebouncePlugin(Star):
         self.buffers.clear()
         self.pending_llm_sessions.clear()
         self.discard_responses.clear()
+        self.last_sent_messages.clear()
+        self.waiting_sessions.clear()
         self.classifier = None
         logger.info("🛑 消息防抖插件已卸载")
