@@ -72,6 +72,7 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 | `send_threshold` | 浮点 | `0.5` | 完整性判断阈值（0-1），越高越严格 |
 | `timeout_seconds` | 整数 | `30` | 超时自动发送时间（秒），设为 0 禁用 |
 | `enabled` | 布尔 | `true` | 是否启用插件 |
+| `cancel_on_new_message` | 布尔 | `true` | LLM 回复前收到新消息时取消回复 |
 | `debug_mode` | 布尔 | `false` | 调试模式，输出详细日志 |
 
 ### 配置示例
@@ -82,6 +83,7 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
   "send_threshold": 0.6,
   "timeout_seconds": 30,
   "enabled": true,
+  "cancel_on_new_message": true,
   "debug_mode": false
 }
 ```
@@ -102,7 +104,28 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 LLM:  好的！如果明天天气好，我们可以一起去爬山~
 ```
 
-### 场景 2：超时处理
+### 场景 2：用户补充内容（启用 cancel_on_new_message）
+
+```
+用户: 如果明天不下雨
+      ↓ 判断：未完整，缓存
+
+用户: 我们去爬山吧
+      ↓ 判断：完整，发送给 LLM
+      ⏳ LLM 正在思考中...
+
+用户: 顺便带上野餐垫
+      ↓ 检测到：用户在等待回复时又发消息
+      ❌ 取消 LLM 当前回复
+      ✅ 将新消息加入缓存，继续等待
+
+用户: 和水果
+      ↓ 判断：完整，合并所有内容发送
+      
+LLM:  好的！明天天气好的话，我们去爬山，我会准备野餐垫和水果~
+```
+
+### 场景 3：超时处理
 
 ```
 用户: 虽然今天很累
@@ -184,6 +207,14 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 ### Q4: 插件会影响性能吗？
 
 **A**: 影响极小。ONNX 推理在 CPU 上耗时 < 10ms，可忽略不计。
+
+### Q5: 什么是"取消回复"功能？
+
+**A**: 当用户在等待 LLM 回复时又发送新消息，插件会：
+- **启用时**：自动取消当前 LLM 回复，合并新消息后重新发送
+- **禁用时**：不取消回复，新消息会作为独立消息处理
+
+建议保持启用，以获得更好的对话体验。
 
 ---
 

@@ -91,6 +91,9 @@ class DebouncePlugin(Star):
         # 分类器（延迟加载）
         self.classifier: Optional[SentenceClassifier] = None
         
+        # 正在等待 LLM 回复的会话集合
+        self.pending_llm_sessions: set = set()
+        
         # 插件目录
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         
@@ -214,6 +217,20 @@ class DebouncePlugin(Star):
         threshold = self._get_config("send_threshold", 0.5)
         timeout_seconds = self._get_config("timeout_seconds", 30)
         debug_mode = self._get_config("debug_mode", False)
+        cancel_on_new = self._get_config("cancel_on_new_message", True)
+        
+        # 检查该会话是否正在等待 LLM 回复
+        if cancel_on_new and session_id in self.pending_llm_sessions:
+            # 用户在等待回复时又发了新消息，说明想补充内容
+            buffer.add(message_text)
+            self.pending_llm_sessions.discard(session_id)  # 取消待处理标记
+            
+            if debug_mode:
+                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已取消回复并缓存: {message_text}")
+            
+            # 阻止这次 LLM 请求
+            event.stop_event()
+            return
         
         # 检查是否超时
         if buffer.messages and buffer.is_timeout(timeout_seconds):
@@ -244,6 +261,11 @@ class DebouncePlugin(Star):
             # 句子完整，清空缓冲区并发送
             buffer.clear()
             
+            # 如果启用了取消功能，标记该会话正在等待 LLM 回复
+            cancel_on_new = self._get_config("cancel_on_new_message", True)
+            if cancel_on_new:
+                self.pending_llm_sessions.add(session_id)
+            
             # 修改请求内容为完整消息
             if hasattr(req, 'prompt') and req.prompt:
                 req.prompt = full_text
@@ -256,6 +278,18 @@ class DebouncePlugin(Star):
             
             if debug_mode:
                 logger.info(f"[防抖] 等待更多输入，当前缓存: {full_text}")
+    
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """LLM 回复后的钩子 - 清除待处理标记"""
+        session_id = event.message_obj.session_id
+        
+        # 清除待处理标记
+        self.pending_llm_sessions.discard(session_id)
+        
+        debug_mode = self._get_config("debug_mode", False)
+        if debug_mode:
+            logger.info(f"[防抖] LLM 回复完成，清除会话 {session_id} 的待处理标记")
     
     async def _timeout_checker(self):
         """后台任务：定期检查并清理超时的缓冲区"""
@@ -287,5 +321,6 @@ class DebouncePlugin(Star):
                 pass
         
         self.buffers.clear()
+        self.pending_llm_sessions.clear()
         self.classifier = None
         logger.info("🛑 消息防抖插件已卸载")
