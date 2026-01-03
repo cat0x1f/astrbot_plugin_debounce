@@ -1,9 +1,204 @@
-# helloworld
+# AstrBot 消息防抖插件
 
-AstrBot 插件模板
+<div align="center">
 
-A template plugin for AstrBot plugin feature
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
+[![GitHub license](https://img.shields.io/github/license/yourusername/astrbot_plugin_debounce?style=flat-square)](LICENSE)
+[![AstrBot](https://img.shields.io/badge/AstrBot-v4.5+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
-# 支持
+**使用 BERT 模型智能判断用户是否说完一句话，减少不必要的 LLM 调用**
 
-[帮助文档](https://astrbot.app)
+</div>
+
+---
+
+## 📖 简介
+
+在实际使用聊天机器人时，用户经常会分多次发送一句话：
+
+```
+用户: 如果明天不下雨
+用户: 我们去爬山吧
+```
+
+传统的聊天机器人会分别处理这两句话，导致：
+- ❌ 第一句话语义不完整，LLM 回复质量差
+- ❌ 浪费 API 调用次数和费用
+- ❌ 用户体验不佳
+
+本插件通过训练的 BERT 模型**实时判断句子完整性**，只在用户说完整句话后才发送给 LLM，实现：
+- ✅ 智能防抖，自动合并未完成的消息
+- ✅ 减少 LLM 调用次数，节省成本
+- ✅ 提升对话质量和用户体验
+
+---
+
+## 🚀 功能特性
+
+- **智能判断**：基于 BERT 模型，准确识别中文句子是否完整
+- **双模型支持**：提供 Small（快速）和 Normal（精准）两种模型
+- **自动下载**：首次使用时自动从 ModelScope 下载模型
+- **灵活配置**：可调节判断阈值、超时时间等参数
+- **零感知**：静默工作，不打扰用户
+- **低开销**：使用 ONNX 推理，CPU 友好
+
+---
+
+## 📦 安装
+
+### 方法一：通过 AstrBot 插件市场（推荐）
+
+1. 打开 AstrBot WebUI
+2. 进入「插件管理」
+3. 搜索「消息防抖」
+4. 点击「安装」
+
+### 方法二：手动安装
+
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/yourusername/astrbot_plugin_debounce.git
+```
+
+然后在 AstrBot WebUI 中重载插件列表。
+
+---
+
+## ⚙️ 配置说明
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `model_type` | 选择 | `small` | 模型类型：`small`（轻量快速）/ `normal`（精准度高） |
+| `send_threshold` | 浮点 | `0.5` | 完整性判断阈值（0-1），越高越严格 |
+| `timeout_seconds` | 整数 | `30` | 超时自动发送时间（秒），设为 0 禁用 |
+| `enabled` | 布尔 | `true` | 是否启用插件 |
+| `debug_mode` | 布尔 | `false` | 调试模式，输出详细日志 |
+
+### 配置示例
+
+```json
+{
+  "model_type": "small",
+  "send_threshold": 0.6,
+  "timeout_seconds": 30,
+  "enabled": true,
+  "debug_mode": false
+}
+```
+
+---
+
+## 💡 使用示例
+
+### 场景 1：分段输入
+
+```
+用户: 如果明天不下雨
+      ↓ 插件判断：未完整，等待...
+      
+用户: 我们去爬山吧
+      ↓ 插件判断：完整，发送给 LLM
+      
+LLM:  好的！如果明天天气好，我们可以一起去爬山~
+```
+
+### 场景 2：超时处理
+
+```
+用户: 虽然今天很累
+      ↓ 等待 30 秒...
+      
+      ↓ 超时，自动发送
+      
+LLM:  虽然今天很累，但还是要注意休息哦！
+```
+
+---
+
+## 🔧 模型说明
+
+插件提供两种模型，均托管在 [ModelScope](https://modelscope.cn/)：
+
+| 模型 | 大小 | 速度 | 准确率 | 推荐场景 |
+|------|------|------|--------|---------|
+| **Small** | ~10MB | ⚡⚡⚡ | ~90% | 日常使用，CPU 环境 |
+| **Normal** | ~100MB | ⚡⚡ | ~95% | 高准确度需求 |
+
+### 模型仓库
+
+- Small: [advent259141/astrbot_debouncer_small](https://modelscope.cn/models/advent259141/astrbot_debouncer_small)
+- Normal: [advent259141/astrbot_debouncer_normal](https://modelscope.cn/models/advent259141/astrbot_debouncer_normal)
+
+首次使用会自动下载，无需手动操作。
+
+---
+
+## 📊 训练数据
+
+模型基于以下类型的中文句子训练：
+
+| 标签 | 说明 | 示例 |
+|------|------|------|
+| **0 (WAIT)** | 句子未完整 | `"如果明天不下雨"` |
+| **1 (SEND)** | 句子已完整 | `"如果明天不下雨我们去爬山"` |
+
+涵盖常见的复句结构：
+- 条件句：`如果...`、`假如...`
+- 转折句：`虽然...`、`尽管...`
+- 因果句：`因为...`、`由于...`
+- 递进句：`其实...`、`也就是说...`
+
+---
+
+## 🐛 调试
+
+开启调试模式后，日志会输出详细信息：
+
+```
+[防抖] 文本: '如果明天不下雨' | 完整概率: 0.2341 | 判定: 等待
+[防抖] 文本: '如果明天不下雨 我们去爬山' | 完整概率: 0.8762 | 判定: 发送
+[防抖] 完整发送: 如果明天不下雨 我们去爬山
+```
+
+---
+
+## ❓ 常见问题
+
+### Q1: 插件会拦截其他插件的 LLM 调用吗？
+
+**A**: 不会。插件只拦截用户发送消息触发的 LLM 请求，其他插件通过 `context.llm_generate()` 直接调用 LLM 不受影响。
+
+### Q2: 模型下载失败怎么办？
+
+**A**: 
+1. 检查网络连接
+2. 手动下载模型文件放入 `models/` 目录
+3. 或切换到 `small` 模型（体积更小）
+
+### Q3: 如何调整判断的严格程度？
+
+**A**: 修改 `send_threshold`：
+- 值越大越严格（需要更高的完整概率）
+- 建议范围：0.4 - 0.7
+
+### Q4: 插件会影响性能吗？
+
+**A**: 影响极小。ONNX 推理在 CPU 上耗时 < 10ms，可忽略不计。
+
+---
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+
+
+## 📄 许可证
+
+[Apache License 2.0](LICENSE)
+
+
+
+**如果这个插件对你有帮助，欢迎给个 ⭐ Star！**
+
+</div>

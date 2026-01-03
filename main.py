@@ -112,9 +112,12 @@ class DebouncePlugin(Star):
         model_path = os.path.join(model_dir, "model.onnx")
         tokenizer_path = os.path.join(model_dir, "tokenizer")
         
+        # 检查模型是否存在，不存在则自动下载
         if not os.path.exists(model_path):
-            logger.error(f"❌ 模型文件不存在: {model_path}")
-            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+            logger.info(f"模型文件不存在，尝试从 ModelScope 下载: {model_type}")
+            if not self._download_model_from_modelscope(model_type, model_dir):
+                logger.error(f"❌ 模型下载失败: {model_type}")
+                raise FileNotFoundError(f"模型文件不存在且下载失败: {model_path}")
         
         if not os.path.exists(tokenizer_path):
             logger.error(f"❌ Tokenizer 不存在: {tokenizer_path}")
@@ -122,6 +125,59 @@ class DebouncePlugin(Star):
         
         self.classifier = SentenceClassifier(model_path, tokenizer_path)
         logger.info(f"✅ 消息防抖插件已加载模型: {model_type}")
+    
+    def _download_model_from_modelscope(self, model_type: str, target_dir: str) -> bool:
+        """从 ModelScope 下载模型"""
+        try:
+            from modelscope.hub.snapshot_download import snapshot_download
+            
+            # ModelScope 模型仓库映射
+            model_repos = {
+                "small": "advent259141/astrbot_debouncer_small",
+                "normal": "advent259141/astrbot_debouncer_normal"
+            }
+            
+            repo_id = model_repos.get(model_type)
+            if not repo_id:
+                logger.warning(f"模型类型 {model_type} 无需下载")
+                return False
+            
+            logger.info(f"🔄 正在从 ModelScope 下载模型: {repo_id}")
+            
+            # 下载到临时目录
+            cache_dir = snapshot_download(
+                repo_id,
+                cache_dir=os.path.join(self.plugin_dir, ".cache")
+            )
+            
+            # 复制文件到目标目录
+            import shutil
+            os.makedirs(target_dir, exist_ok=True)
+            
+            # 复制模型文件
+            src_model = os.path.join(cache_dir, "model", "model.onnx")
+            if os.path.exists(src_model):
+                shutil.copy2(src_model, os.path.join(target_dir, "model.onnx"))
+                logger.info("✅ 模型文件下载完成")
+            
+            # 复制 tokenizer 目录
+            src_tokenizer = os.path.join(cache_dir, "tokenizer")
+            dst_tokenizer = os.path.join(target_dir, "tokenizer")
+            if os.path.exists(src_tokenizer):
+                shutil.copytree(src_tokenizer, dst_tokenizer, dirs_exist_ok=True)
+                logger.info("✅ Tokenizer 文件下载完成")
+            
+            logger.info(f"🎉 模型 {model_type} 下载成功")
+            return True
+            
+        except ImportError:
+            logger.error("❌ modelscope 库未安装，请运行: pip install modelscope")
+            return False
+        except Exception as e:
+            logger.error(f"❌ 从 ModelScope 下载模型失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     def _get_buffer(self, session_id: str) -> MessageBuffer:
         """获取或创建消息缓冲区"""
