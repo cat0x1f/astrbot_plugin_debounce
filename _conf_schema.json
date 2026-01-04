@@ -9,13 +9,13 @@
     "send_threshold": {
         "type": "float",
         "description": "判断句子完整的概率阈值",
-        "default": 0.5,
+        "default": 0.8,
         "hint": "取值范围 0-1，越高则越严格（需要更高的完整概率才会发送）"
     },
     "timeout_seconds": {
         "type": "int",
         "description": "消息缓存超时时间（秒）",
-        "default": 30,
+        "default": 10,
         "hint": "超过此时间后，即使句子未完整也会自动发送。设为 0 表示不超时"
     },
     "enabled": {
