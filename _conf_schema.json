@@ -24,12 +24,6 @@
         "default": true,
         "hint": "关闭后插件将不拦截任何消息"
     },
-    "debug_mode": {
-        "type": "bool",
-        "description": "调试模式",
-        "default": false,
-        "hint": "开启后会在日志中输出详细的推理信息"
-    },
     "cancel_on_new_message": {
         "type": "bool",
         "description": "LLM 回复前收到新消息时取消回复",

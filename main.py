@@ -16,7 +16,8 @@ from transformers import AutoTokenizer
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
+from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
 
 
 @dataclass
@@ -24,10 +25,13 @@ class MessageBuffer:
     """消息缓冲区，用于存储用户未完成的消息"""
     messages: list = field(default_factory=list)
     last_update: float = field(default_factory=time.time)
+    event: Optional[AstrMessageEvent] = None  # 保存最后一个event用于超时发送
     
-    def add(self, message: str):
+    def add(self, message: str, event: AstrMessageEvent = None):
         self.messages.append(message)
         self.last_update = time.time()
+        if event:
+            self.event = event
     
     def get_full_text(self) -> str:
         return " ".join(self.messages)
@@ -35,6 +39,7 @@ class MessageBuffer:
     def clear(self):
         self.messages = []
         self.last_update = time.time()
+        self.event = None
     
     def is_timeout(self, timeout_seconds: int) -> bool:
         if timeout_seconds <= 0:
@@ -82,44 +87,51 @@ class SentenceClassifier:
 
 class DebouncePlugin(Star):
     
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+        logger.info(f"插件配置: {dict(config)}")
         
         # 消息缓冲区 {session_id: MessageBuffer}
         self.buffers: Dict[str, MessageBuffer] = {}
         
-        # 分类器（延迟加载）
-        self.classifier: Optional[SentenceClassifier] = None
+        # 正在等待中的会话集合（等待更多消息）
+        self.waiting_sessions: set = set()
         
-        # 正在等待 LLM 回复的会话集合
-        self.pending_llm_sessions: set = set()
+        # 后台监控任务集合 {session_id: Task}
+        self.monitor_tasks: Dict[str, asyncio.Task] = {}
         
-        # 需要丢弃回复的会话集合
+        # 跳过防抖的消息ID集合（伪造的消息）
+        self.skip_debounce_msg_ids: set = set()
+        
+        # 正在处理LLM请求的会话字典 {session_id: message_text}
+        self.pending_llm_sessions: Dict[str, str] = {}
+        
+        # 需要丢弃响应的会话集合
         self.discard_responses: set = set()
         
-        # 记录上次发送的消息内容（用于恢复）
-        self.last_sent_messages: Dict[str, str] = {}
-        
-        # 正在等待的会话集合（防止重复等待）
-        self.waiting_sessions: set = set()
+        # 分类器（延迟加载）
+        self.classifier = None
         
         # 插件目录
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         
         # 超时检查任务
         self._timeout_task: Optional[asyncio.Task] = None
-    
-    def _get_config(self, key: str, default=None):
-        """获取插件配置"""
-        config = self.context.get_config()
-        return config.get(key, default)
+        
+        # 加载模型
+        try:
+            self._load_classifier()
+        except Exception as e:
+            logger.warning(f"消息防抖插件模型加载失败: {e}")
+            logger.warning("插件将在禁用状态运行，请检查模型文件")
     
     def _load_classifier(self):
         """加载分类模型"""
         if self.classifier is not None:
             return
         
-        model_type = self._get_config("model_type", "small")
+        model_type = self.config.get("model_type", "small")
         model_dir = os.path.join(self.plugin_dir, "models", model_type)
         model_path = os.path.join(model_dir, "model.onnx")
         tokenizer_path = os.path.join(model_dir, "tokenizer")
@@ -197,170 +209,145 @@ class DebouncePlugin(Star):
             self.buffers[session_id] = MessageBuffer()
         return self.buffers[session_id]
     
-    @filter.on_llm_request(priority=100)  # 高优先级，优先拦截
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """LLM 请求前的钩子 - 核心防抖逻辑"""
+    @filter.on_will_llm_request(priority=100)
+    async def on_will_llm_request(self, event: AstrMessageEvent):
+        """即将调用 LLM 时的通知（在 session lock 之前）- 用于检测新消息到达"""
         
         # 检查是否启用
-        if not self._get_config("enabled", True):
+        if not self.config.get("enabled", True):
             return
         
-        # 延迟加载模型
-        try:
-            self._load_classifier()
-        except FileNotFoundError as e:
-            logger.warning(f"消息防抖插件模型加载失败，跳过防抖: {e}")
+        session_id = event.message_obj.session_id
+        msg_id = event.message_obj.message_id
+        
+        # 跳过伪造消息
+        if msg_id in self.skip_debounce_msg_ids:
+            # 不在这里移除，留到 on_llm_request 移除
+            logger.info(f"[Debounce] 检测到伪造消息（跳过状态检查）: {session_id}")
             return
         
-        # 启动超时检查任务（懒加载）
-        if self._timeout_task is None:
-            self._timeout_task = asyncio.create_task(self._timeout_checker())
+        # 取消之前的监控任务
+        if session_id in self.monitor_tasks:
+            self.monitor_tasks[session_id].cancel()
+            del self.monitor_tasks[session_id]
+            logger.info(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
+        
+        # 如果之前的请求还在处理中，标记需要丢弃其响应，并恢复原消息到buffer
+        if session_id in self.pending_llm_sessions:
+            old_message = self.pending_llm_sessions[session_id]
+            self.discard_responses.add(session_id)
+            
+            # 恢复被取消的消息到buffer，以便和新消息合并
+            buffer = self._get_buffer(session_id)
+            if old_message and old_message not in buffer.messages:
+                buffer.messages.insert(0, old_message)  # 插入到开头
+                buffer.last_update = time.time()
+                self.waiting_sessions.add(session_id)  # 标记为等待状态
+                logger.info(f"[Debounce] 恢复被取消的消息到buffer: {old_message}")
+            logger.info(f"[Debounce] 标记旧响应需要丢弃: {session_id}")
+    
+    @filter.on_llm_request(priority=100)
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """LLM 请求前的钩子 - 核心防抖逻辑（不阻塞）"""
+        
+        # 检查是否启用
+        if not self.config.get("enabled", True):
+            return
+        
+        # 检查模型是否加载成功
+        if self.classifier is None:
+            return
         
         session_id = event.message_obj.session_id
         message_text = event.message_str.strip()
+        msg_id = event.message_obj.message_id
         
         if not message_text:
             return
         
-        buffer = self._get_buffer(session_id)
-        threshold = self._get_config("send_threshold", 0.5)
-        timeout_seconds = self._get_config("timeout_seconds", 30)
-        debug_mode = self._get_config("debug_mode", False)
-        cancel_on_new = self._get_config("cancel_on_new_message", True)
-        
-        # 检查该会话是否正在等待 LLM 回复
-        if cancel_on_new and session_id in self.pending_llm_sessions:
-            # 用户在等待回复时又发了新消息，说明想补充内容
-            # 标记需要丢弃旧回复
-            self.discard_responses.add(session_id)
-            
-            # 恢复上次发送的消息到缓冲区
-            if session_id in self.last_sent_messages:
-                buffer.messages = [self.last_sent_messages[session_id]]
-            
-            # 将新消息加入缓冲区
-            buffer.add(message_text)
-            
-            if debug_mode:
-                logger.info(f"[防抖] 检测到 LLM 回复前的新消息，已恢复上次消息并合并: {buffer.get_full_text()}")
-            
-            # 注意：不调用 stop_event()，让新消息继续正常的防抖流程
-            # 继续往下执行，重新判断完整性
-        elif session_id in self.waiting_sessions:
-            # 已有其他消息在等待中，只添加到缓存
-            buffer.add(message_text)
-            event.stop_event()
-            
-            if debug_mode:
-                logger.info(f"[防抖] 检测到正在等待中，添加到缓存: {buffer.get_full_text()}")
+        # 跳过伪造消息（已经是超时后主动发送的，直接通过）
+        if msg_id in self.skip_debounce_msg_ids:
+            self.skip_debounce_msg_ids.remove(msg_id)
+            # 标记正在处理LLM请求
+            self.pending_llm_sessions[session_id] = message_text
+            logger.info(f"[Debounce] 伪造消息直接通过: {session_id}")
             return
         
-        # 如果正在等待旧回复，先不添加新消息（已在上面添加过）
-        if not (cancel_on_new and session_id in self.pending_llm_sessions):
-            # 添加新消息到缓冲区
-            buffer.add(message_text)
+        buffer = self._get_buffer(session_id)
+        threshold = self.config.get("send_threshold", 0.5)
+        timeout_seconds = self.config.get("timeout_seconds", 30)
+        
+        # 如果该会话正在等待中，将新消息添加到buffer
+        if session_id in self.waiting_sessions:
+            buffer.add(message_text, event)
+            logger.info(f"消息已添加到缓冲区: {session_id}")
+            
+            # 重新判断合并后的完整性
+            full_text = buffer.get_full_text()
+            score_send, _ = self.classifier.predict(full_text)
+            is_complete = score_send >= threshold
+            logger.info(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '继续等待'}")
+            
+            if is_complete:
+                # 现在完整了，取消监控任务
+                if session_id in self.monitor_tasks:
+                    self.monitor_tasks[session_id].cancel()
+                    del self.monitor_tasks[session_id]
+                
+                # 清除等待标记
+                self.waiting_sessions.discard(session_id)
+                
+                # 修改事件的消息内容为合并后的完整文本
+                event.message_str = full_text
+                logger.info(f"[Debounce] 合并消息发送: {full_text}")
+                
+                # 清空buffer
+                buffer.clear()
+                
+                # 标记该会话正在处理 LLM 请求，并记录消息内容
+                self.pending_llm_sessions[session_id] = full_text
+                return  # 让这条消息正常发送
+            else:
+                # 还是不完整，阻止当前消息
+                event.stop_event()
+                return
+        
+        # 首次收到消息，添加到buffer
+        buffer.add(message_text, event)
         full_text = buffer.get_full_text()
         
-        # 模型预测
+        # 判断完整性
         score_send, _ = self.classifier.predict(full_text)
         is_complete = score_send >= threshold
-        
-        if debug_mode:
-            logger.info(f"[防抖] 文本: '{full_text}' | 完整概率: {score_send:.4f} | 判定: {'发送' if is_complete else '等待'}")
+        logger.info(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'}")
         
         if is_complete:
-            # 句子完整，记录要发送的内容并清空缓冲区
-            self.last_sent_messages[session_id] = full_text
+            # 完整，清空buffer，让消息通过
             buffer.clear()
-            
-            # 如果启用了取消功能，标记该会话正在等待 LLM 回复
-            cancel_on_new = self._get_config("cancel_on_new_message", True)
-            if cancel_on_new:
-                self.pending_llm_sessions.add(session_id)
-            
-            # 修改请求内容为完整消息
-            if hasattr(req, 'prompt') and req.prompt:
-                req.prompt = full_text
-            
-            if debug_mode:
-                logger.info(f"[防抖] 完整发送: {full_text}")
+            # 标记该会话正在处理 LLM 请求，并记录消息内容
+            self.pending_llm_sessions[session_id] = message_text
+            return
         else:
-            # 句子未完整，进入等待循环
-            if debug_mode:
-                logger.info(f"[防抖] 句子未完整，进入等待: {full_text}")
-            
-            # 标记该会话正在等待
+            # 不完整，阻止发送，启动监控任务
+            event.stop_event()
             self.waiting_sessions.add(session_id)
-            initial_update_time = buffer.last_update
             
-            try:
-                # 循环等待直到超时或有新消息
-                while True:
-                    await asyncio.sleep(1)  # 每秒检查一次
-                    
-                    # 检查是否有新消息到来
-                    if buffer.last_update > initial_update_time:
-                        # 有新消息，重新判断完整性
-                        full_text = buffer.get_full_text()
-                        score_send, _ = self.classifier.predict(full_text)
-                        is_complete = score_send >= threshold
-                        
-                        if debug_mode:
-                            logger.info(f"[防抖] 检测到新消息，重新判断: '{full_text}' | 完整概率: {score_send:.4f} | 判定: {'发送' if is_complete else '等待'}")
-                        
-                        if is_complete:
-                            # 现在完整了，发送
-                            self.last_sent_messages[session_id] = full_text
-                            buffer.clear()
-                            
-                            # 标记等待 LLM 回复
-                            if cancel_on_new:
-                                self.pending_llm_sessions.add(session_id)
-                            
-                            # 修改请求内容为完整消息
-                            if hasattr(req, 'prompt') and req.prompt:
-                                req.prompt = full_text
-                            
-                            if debug_mode:
-                                logger.info(f"[防抖] 等待期间变完整，发送: {full_text}")
-                            
-                            return  # 不调用 stop_event()，允许请求继续
-                        else:
-                            # 还是不完整，更新时间，继续等待
-                            initial_update_time = buffer.last_update
-                    
-                    # 检查是否超时
-                    if buffer.is_timeout(timeout_seconds):
-                        # 超时，发送当前缓存的内容
-                        full_text = buffer.get_full_text()
-                        buffer.clear()
-                        
-                        # 修改请求内容为缓存消息
-                        if hasattr(req, 'prompt') and req.prompt:
-                            req.prompt = full_text
-                        
-                        if debug_mode:
-                            logger.info(f"[防抖] 等待超时，发送: {full_text}")
-                        
-                        return  # 不调用 stop_event()，允许请求继续
-            
-            finally:
-                # 确保清除等待标记
-                self.waiting_sessions.discard(session_id)
+            # 启动后台监控任务（如果还没有）
+            if session_id not in self.monitor_tasks:
+                task = asyncio.create_task(self._monitor_session(session_id, timeout_seconds))
+                self.monitor_tasks[session_id] = task
+            return
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp):
-        """LLM 回复后的钩子 - 检查是否需要丢弃回复"""
+        """LLM 响应后的钩子 - 用于取消过时的响应"""
         session_id = event.message_obj.session_id
-        debug_mode = self._get_config("debug_mode", False)
         
         # 检查是否需要丢弃这个回复
         if session_id in self.discard_responses:
             self.discard_responses.discard(session_id)
-            self.pending_llm_sessions.discard(session_id)
-            
-            if debug_mode:
-                logger.info(f"[防抖] 已丢弃过时的 LLM 回复")
+            self.pending_llm_sessions.pop(session_id, None)
+            logger.info(f"已丢弃过时的 LLM 回复: {session_id}")
             
             # 阻止回复发送 - 清空响应内容
             if hasattr(resp, 'completion_text'):
@@ -368,20 +355,14 @@ class DebouncePlugin(Star):
             return
         
         # 清除待处理标记
-        self.pending_llm_sessions.discard(session_id)
-        
-        # 清除已发送消息的记录
-        self.last_sent_messages.pop(session_id, None)
-        
-        if debug_mode:
-            logger.info(f"[防抖] LLM 回复完成，清除会话 {session_id} 的待处理标记")
+        self.pending_llm_sessions.pop(session_id, None)
     
     async def _timeout_checker(self):
         """后台任务：定期清理过期的缓冲区"""
         while True:
             await asyncio.sleep(60)  # 每分钟检查一次
             
-            timeout_seconds = self._get_config("timeout_seconds", 30)
+            timeout_seconds = self.config.get("timeout_seconds", 30)
             if timeout_seconds <= 0:
                 continue
             
@@ -407,7 +388,82 @@ class DebouncePlugin(Star):
         self.buffers.clear()
         self.pending_llm_sessions.clear()
         self.discard_responses.clear()
-        self.last_sent_messages.clear()
+        self.skip_debounce_msg_ids.clear()
         self.waiting_sessions.clear()
         self.classifier = None
         logger.info("🛑 消息防抖插件已卸载")
+    
+    async def _monitor_session(self, session_id: str, timeout_seconds: int):
+        """监控会话超时，超时后伪造事件发送"""
+        try:
+            # 等待超时时间
+            await asyncio.sleep(timeout_seconds)
+            
+            # 检查buffer是否还在等待（可能已被新消息触发发送）
+            if session_id not in self.waiting_sessions:
+                return
+            
+            buffer = self.buffers.get(session_id)
+            if not buffer:
+                return
+            
+            # 超时了，获取缓存的消息和event
+            full_text = buffer.get_full_text()
+            saved_event = buffer.event
+            
+            if not full_text or not saved_event:
+                return
+            
+            logger.info(f"[Debounce] 等待超时，伪造事件发送: {session_id}")
+            
+            # 清除等待状态
+            self.waiting_sessions.discard(session_id)
+            buffer.clear()
+            
+            # 伪造一个新消息事件
+            await self._send_fake_event(saved_event, full_text)
+        
+        except asyncio.CancelledError:
+            # 任务被取消（有新消息到达）
+            logger.info(f"[Debounce] 监控任务被取消: {session_id}")
+        except Exception as e:
+            logger.error(f"[Debounce] 超时发送失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            # 清理任务记录
+            self.monitor_tasks.pop(session_id, None)
+    
+    async def _send_fake_event(self, original_event: AstrMessageEvent, message_text: str):
+        """伪造一个消息事件并发送到EventBus"""
+        try:
+            from astrbot.core.star.star_tools import StarTools
+            from astrbot.core.message.components import Plain
+            
+            # 创建新消息对象
+            new_message = await StarTools.create_message(
+                type=str(original_event.message_obj.type.value),
+                self_id=original_event.get_self_id(),
+                session_id=original_event.session_id,
+                sender=original_event.message_obj.sender,
+                message=[Plain(message_text)],
+                message_str=message_text,
+                group_id=original_event.get_group_id() or ""
+            )
+            
+            # 标记这个消息需要跳过防抖
+            self.skip_debounce_msg_ids.add(new_message.message_id)
+            
+            # 伪造事件并提交
+            await StarTools.create_event(
+                abm=new_message,
+                platform=original_event.get_platform_name(),
+                is_wake=True
+            )
+            
+            logger.info(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
+            
+        except Exception as e:
+            logger.error(f"[Debounce] 伪造事件失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
