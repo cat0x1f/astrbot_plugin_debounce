@@ -1,5 +1,7 @@
 # AstrBot 消息防抖插件
 
+> ⚠️ **注意：本插件仅支持 AstrBot 4.11+ 版本使用**
+> 
 <div align="center">
 
 [![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
@@ -364,4 +366,5 @@ if session_id in self.pending_llm_sessions:
 **如果这个插件对你有帮助，欢迎给个 ⭐ Star！**
 
 </div>
+
 
