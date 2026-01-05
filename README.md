@@ -5,7 +5,7 @@
 <div align="center">
 
 [![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
-[![GitHub license](https://img.shields.io/github/license/advent259141e/astrbot_plugin_debounce?style=flat-square)](LICENSE)
+[![GitHub license](https://img.shields.io/github/license/advent259141/astrbot_plugin_debounce?style=flat-square)](LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.11+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
 **使用 BERT 模型智能判断用户是否说完一句话，减少不必要的 LLM 调用**
@@ -366,5 +366,6 @@ if session_id in self.pending_llm_sessions:
 **如果这个插件对你有帮助，欢迎给个 ⭐ Star！**
 
 </div>
+
 
 
