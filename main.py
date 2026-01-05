@@ -53,7 +53,7 @@ class SentenceClassifier:
     def __init__(self, model_path: str, tokenizer_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.session = ort.InferenceSession(model_path)
-        logger.info(f"🚀 消息防抖模型已加载: {model_path}")
+        logger.debug(f"🚀 消息防抖模型已加载: {model_path}")
     
     def predict(self, text: str) -> tuple[bool, float]:
         """
@@ -90,7 +90,7 @@ class DebouncePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        logger.info(f"插件配置: {dict(config)}")
+        logger.debug(f"插件配置: {dict(config)}")
         
         # 消息缓冲区 {session_id: MessageBuffer}
         self.buffers: Dict[str, MessageBuffer] = {}
@@ -138,7 +138,7 @@ class DebouncePlugin(Star):
         
         # 检查模型是否存在，不存在则自动下载
         if not os.path.exists(model_path):
-            logger.info(f"模型文件不存在，尝试从 ModelScope 下载: {model_type}")
+            logger.debug(f"模型文件不存在，尝试从 ModelScope 下载: {model_type}")
             if not self._download_model_from_modelscope(model_type, model_dir):
                 logger.error(f"❌ 模型下载失败: {model_type}")
                 raise FileNotFoundError(f"模型文件不存在且下载失败: {model_path}")
@@ -148,7 +148,7 @@ class DebouncePlugin(Star):
             raise FileNotFoundError(f"Tokenizer 不存在: {tokenizer_path}")
         
         self.classifier = SentenceClassifier(model_path, tokenizer_path)
-        logger.info(f"✅ 消息防抖插件已加载模型: {model_type}")
+        logger.debug(f"✅ 消息防抖插件已加载模型: {model_type}")
     
     def _download_model_from_modelscope(self, model_type: str, target_dir: str) -> bool:
         """从 ModelScope 下载模型"""
@@ -166,7 +166,7 @@ class DebouncePlugin(Star):
                 logger.warning(f"模型类型 {model_type} 无需下载")
                 return False
             
-            logger.info(f"🔄 正在从 ModelScope 下载模型: {repo_id}")
+            logger.debug(f"🔄 正在从 ModelScope 下载模型: {repo_id}")
             
             # 下载到临时目录
             cache_dir = snapshot_download(
@@ -182,16 +182,16 @@ class DebouncePlugin(Star):
             src_model = os.path.join(cache_dir, "model", "model.onnx")
             if os.path.exists(src_model):
                 shutil.copy2(src_model, os.path.join(target_dir, "model.onnx"))
-                logger.info("✅ 模型文件下载完成")
+                logger.debug("✅ 模型文件下载完成")
             
             # 复制 tokenizer 目录
             src_tokenizer = os.path.join(cache_dir, "tokenizer")
             dst_tokenizer = os.path.join(target_dir, "tokenizer")
             if os.path.exists(src_tokenizer):
                 shutil.copytree(src_tokenizer, dst_tokenizer, dirs_exist_ok=True)
-                logger.info("✅ Tokenizer 文件下载完成")
+                logger.debug("✅ Tokenizer 文件下载完成")
             
-            logger.info(f"🎉 模型 {model_type} 下载成功")
+            logger.debug(f"🎉 模型 {model_type} 下载成功")
             return True
             
         except ImportError:
@@ -209,8 +209,8 @@ class DebouncePlugin(Star):
             self.buffers[session_id] = MessageBuffer()
         return self.buffers[session_id]
     
-    @filter.on_will_llm_request(priority=100)
-    async def on_will_llm_request(self, event: AstrMessageEvent):
+    @filter.on_waiting_llm_request(priority=100)
+    async def on_waiting_llm_request(self, event: AstrMessageEvent):
         """即将调用 LLM 时的通知（在 session lock 之前）- 用于检测新消息到达"""
         
         # 检查是否启用
@@ -223,14 +223,14 @@ class DebouncePlugin(Star):
         # 跳过伪造消息
         if msg_id in self.skip_debounce_msg_ids:
             # 不在这里移除，留到 on_llm_request 移除
-            logger.info(f"[Debounce] 检测到伪造消息（跳过状态检查）: {session_id}")
+            logger.debug(f"[Debounce] 检测到伪造消息（跳过状态检查）: {session_id}")
             return
         
         # 取消之前的监控任务
         if session_id in self.monitor_tasks:
             self.monitor_tasks[session_id].cancel()
             del self.monitor_tasks[session_id]
-            logger.info(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
+            logger.debug(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
         
         # 如果之前的请求还在处理中，标记需要丢弃其响应，并恢复原消息到buffer
         if session_id in self.pending_llm_sessions:
@@ -243,12 +243,12 @@ class DebouncePlugin(Star):
                 buffer.messages.insert(0, old_message)  # 插入到开头
                 buffer.last_update = time.time()
                 self.waiting_sessions.add(session_id)  # 标记为等待状态
-                logger.info(f"[Debounce] 恢复被取消的消息到buffer: {old_message}")
-            logger.info(f"[Debounce] 标记旧响应需要丢弃: {session_id}")
+                logger.debug(f"[Debounce] 恢复被取消的消息到buffer: {old_message}")
+            logger.debug(f"[Debounce] 标记旧响应需要丢弃: {session_id}")
     
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """LLM 请求前的钩子 - 核心防抖逻辑（不阻塞）"""
+        """核心防抖逻辑"""
         
         # 检查是否启用
         if not self.config.get("enabled", True):
@@ -270,7 +270,7 @@ class DebouncePlugin(Star):
             self.skip_debounce_msg_ids.remove(msg_id)
             # 标记正在处理LLM请求
             self.pending_llm_sessions[session_id] = message_text
-            logger.info(f"[Debounce] 伪造消息直接通过: {session_id}")
+            logger.debug(f"[Debounce] 伪造消息直接通过: {session_id}")
             return
         
         buffer = self._get_buffer(session_id)
@@ -280,13 +280,13 @@ class DebouncePlugin(Star):
         # 如果该会话正在等待中，将新消息添加到buffer
         if session_id in self.waiting_sessions:
             buffer.add(message_text, event)
-            logger.info(f"消息已添加到缓冲区: {session_id}")
+            logger.debug(f"消息已添加到缓冲区: {session_id}")
             
             # 重新判断合并后的完整性
             full_text = buffer.get_full_text()
             score_send, _ = self.classifier.predict(full_text)
             is_complete = score_send >= threshold
-            logger.info(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '继续等待'}")
+            logger.debug(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '继续等待'}")
             
             if is_complete:
                 # 现在完整了，取消监控任务
@@ -297,9 +297,9 @@ class DebouncePlugin(Star):
                 # 清除等待标记
                 self.waiting_sessions.discard(session_id)
                 
-                # 修改事件的消息内容为合并后的完整文本
-                event.message_str = full_text
-                logger.info(f"[Debounce] 合并消息发送: {full_text}")
+                # 修改 ProviderRequest 的 prompt 为合并后的完整文本
+                req.prompt = full_text
+                logger.debug(f"[Debounce] 合并消息发送: {full_text}")
                 
                 # 清空buffer
                 buffer.clear()
@@ -319,7 +319,7 @@ class DebouncePlugin(Star):
         # 判断完整性
         score_send, _ = self.classifier.predict(full_text)
         is_complete = score_send >= threshold
-        logger.info(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'}")
+        logger.debug(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'}")
         
         if is_complete:
             # 完整，清空buffer，让消息通过
@@ -347,11 +347,10 @@ class DebouncePlugin(Star):
         if session_id in self.discard_responses:
             self.discard_responses.discard(session_id)
             self.pending_llm_sessions.pop(session_id, None)
-            logger.info(f"已丢弃过时的 LLM 回复: {session_id}")
+            logger.debug(f"已丢弃过时的 LLM 回复: {session_id}")
             
-            # 阻止回复发送 - 清空响应内容
-            if hasattr(resp, 'completion_text'):
-                resp.completion_text = ""
+            # 阻止回复发送 - 停止事件传播
+            event.stop_event()
             return
         
         # 清除待处理标记
@@ -391,7 +390,7 @@ class DebouncePlugin(Star):
         self.skip_debounce_msg_ids.clear()
         self.waiting_sessions.clear()
         self.classifier = None
-        logger.info("🛑 消息防抖插件已卸载")
+        logger.debug("🛑 消息防抖插件已卸载")
     
     async def _monitor_session(self, session_id: str, timeout_seconds: int):
         """监控会话超时，超时后伪造事件发送"""
@@ -414,7 +413,7 @@ class DebouncePlugin(Star):
             if not full_text or not saved_event:
                 return
             
-            logger.info(f"[Debounce] 等待超时，伪造事件发送: {session_id}")
+            logger.debug(f"[Debounce] 等待超时，伪造事件发送: {session_id}")
             
             # 清除等待状态
             self.waiting_sessions.discard(session_id)
@@ -425,7 +424,7 @@ class DebouncePlugin(Star):
         
         except asyncio.CancelledError:
             # 任务被取消（有新消息到达）
-            logger.info(f"[Debounce] 监控任务被取消: {session_id}")
+            logger.debug(f"[Debounce] 监控任务被取消: {session_id}")
         except Exception as e:
             logger.error(f"[Debounce] 超时发送失败: {e}")
             import traceback
@@ -461,7 +460,7 @@ class DebouncePlugin(Star):
                 is_wake=True
             )
             
-            logger.info(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
+            logger.debug(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
             
         except Exception as e:
             logger.error(f"[Debounce] 伪造事件失败: {e}")
