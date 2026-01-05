@@ -15,9 +15,9 @@ from transformers import AutoTokenizer
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+from astrbot.api.star import StarTools
 from astrbot.api.provider import ProviderRequest
 from astrbot.api import logger, AstrBotConfig
-from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
 
 
 @dataclass
@@ -55,10 +55,9 @@ class SentenceClassifier:
         self.session = ort.InferenceSession(model_path)
         logger.debug(f"🚀 消息防抖模型已加载: {model_path}")
     
-    def predict(self, text: str) -> tuple[bool, float]:
+    def _predict_sync(self, text: str) -> tuple[float, float]:
         """
-        预测句子是否完整
-        返回: (是否完整, 完整概率)
+        同步预测（内部使用）
         """
         inputs = self.tokenizer(
             text, 
@@ -82,6 +81,13 @@ class SentenceClassifier:
         
         score_send = float(softmax_probs[0][1])  # Label 1 = SEND
         return score_send, score_send
+    
+    async def predict(self, text: str) -> tuple[float, float]:
+        """
+        异步预测句子是否完整（使用线程池避免阻塞事件循环）
+        返回: (完整概率, 完整概率)
+        """
+        return await asyncio.to_thread(self._predict_sync, text)
 
 
 
@@ -113,45 +119,66 @@ class DebouncePlugin(Star):
         # 分类器（延迟加载）
         self.classifier = None
         
-        # 插件目录
-        self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        # 模型加载锁（防止并发加载）
+        self._model_load_lock = asyncio.Lock()
+        
+        # 使用 StarTools 获取数据目录
+        self.data_dir = StarTools.get_data_dir()
         
         # 超时检查任务
         self._timeout_task: Optional[asyncio.Task] = None
-        
-        # 加载模型
-        try:
-            self._load_classifier()
-        except Exception as e:
-            logger.warning(f"消息防抖插件模型加载失败: {e}")
-            logger.warning("插件将在禁用状态运行，请检查模型文件")
     
-    def _load_classifier(self):
-        """加载分类模型"""
-        if self.classifier is not None:
-            return
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """AstrBot 加载完成后的初始化"""
+        # 启动后台清理任务
+        self._timeout_task = asyncio.create_task(self._timeout_checker())
+        logger.debug("消息防抖插件后台任务已启动")
         
-        model_type = self.config.get("model_type", "small")
-        model_dir = os.path.join(self.plugin_dir, "models", model_type)
-        model_path = os.path.join(model_dir, "model.onnx")
-        tokenizer_path = os.path.join(model_dir, "tokenizer")
-        
-        # 检查模型是否存在，不存在则自动下载
-        if not os.path.exists(model_path):
-            logger.debug(f"模型文件不存在，尝试从 ModelScope 下载: {model_type}")
-            if not self._download_model_from_modelscope(model_type, model_dir):
-                logger.error(f"❌ 模型下载失败: {model_type}")
-                raise FileNotFoundError(f"模型文件不存在且下载失败: {model_path}")
-        
-        if not os.path.exists(tokenizer_path):
-            logger.error(f"❌ Tokenizer 不存在: {tokenizer_path}")
-            raise FileNotFoundError(f"Tokenizer 不存在: {tokenizer_path}")
-        
-        self.classifier = SentenceClassifier(model_path, tokenizer_path)
-        logger.debug(f"✅ 消息防抖插件已加载模型: {model_type}")
+        # 异步预加载模型
+        try:
+            await self._load_classifier_async()
+        except Exception as e:
+            logger.warning(f"消息防抖插件模型预加载失败: {e}")
+            logger.warning("插件将在首次使用时尝试加载模型")
+    
+    async def _load_classifier_async(self):
+        """异步加载分类模型"""
+        async with self._model_load_lock:
+            if self.classifier is not None:
+                return
+            
+            model_type = self.config.get("model_type", "small")
+            model_dir = self.data_dir / "models" / model_type
+            model_path = model_dir / "model.onnx"
+            tokenizer_path = model_dir / "tokenizer"
+            
+            # 检查模型是否存在，不存在则自动下载
+            if not model_path.exists():
+                logger.debug(f"模型文件不存在，尝试从 ModelScope 下载: {model_type}")
+                success = await asyncio.to_thread(
+                    self._download_model_from_modelscope, 
+                    model_type, 
+                    str(model_dir)
+                )
+                if not success:
+                    logger.error(f"❌ 模型下载失败: {model_type}")
+                    raise FileNotFoundError(f"模型文件不存在且下载失败: {model_path}")
+            
+            if not tokenizer_path.exists():
+                logger.error(f"❌ Tokenizer 不存在: {tokenizer_path}")
+                raise FileNotFoundError(f"Tokenizer 不存在: {tokenizer_path}")
+            
+            # 在线程池中加载模型（避免阻塞）
+            self.classifier = await asyncio.to_thread(
+                SentenceClassifier,
+                str(model_path),
+                str(tokenizer_path)
+            )
+            logger.debug(f"✅ 消息防抖插件已加载模型: {model_type}")
     
     def _download_model_from_modelscope(self, model_type: str, target_dir: str) -> bool:
-        """从 ModelScope 下载模型"""
+        """从 ModelScope 下载模型（同步方法，应在线程池中调用）"""
         try:
             from modelscope.hub.snapshot_download import snapshot_download
             
@@ -168,10 +195,11 @@ class DebouncePlugin(Star):
             
             logger.debug(f"🔄 正在从 ModelScope 下载模型: {repo_id}")
             
-            # 下载到临时目录
+            # 下载到数据目录的 .cache
+            cache_path = self.data_dir / ".cache"
             cache_dir = snapshot_download(
                 repo_id,
-                cache_dir=os.path.join(self.plugin_dir, ".cache")
+                cache_dir=str(cache_path)
             )
             
             # 复制文件到目标目录
@@ -254,7 +282,14 @@ class DebouncePlugin(Star):
         if not self.config.get("enabled", True):
             return
         
-        # 检查模型是否加载成功
+        # 检查模型是否加载成功，如果未加载则尝试加载
+        if self.classifier is None:
+            try:
+                await self._load_classifier_async()
+            except Exception as e:
+                logger.warning(f"模型加载失败，跳过防抖: {e}")
+                return
+        
         if self.classifier is None:
             return
         
@@ -282,9 +317,9 @@ class DebouncePlugin(Star):
             buffer.add(message_text, event)
             logger.debug(f"消息已添加到缓冲区: {session_id}")
             
-            # 重新判断合并后的完整性
+            # 重新判断合并后的完整性（异步调用）
             full_text = buffer.get_full_text()
-            score_send, _ = self.classifier.predict(full_text)
+            score_send, _ = await self.classifier.predict(full_text)
             is_complete = score_send >= threshold
             logger.debug(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '继续等待'}")
             
@@ -316,8 +351,8 @@ class DebouncePlugin(Star):
         buffer.add(message_text, event)
         full_text = buffer.get_full_text()
         
-        # 判断完整性
-        score_send, _ = self.classifier.predict(full_text)
+        # 判断完整性（异步调用）
+        score_send, _ = await self.classifier.predict(full_text)
         is_complete = score_send >= threshold
         logger.debug(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'}")
         
