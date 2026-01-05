@@ -2,9 +2,9 @@
 
 <div align="center">
 
-[![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
-[![GitHub license](https://img.shields.io/github/license/advent259141/astrbot_plugin_debounce?style=flat-square)](LICENSE)
-[![AstrBot](https://img.shields.io/badge/AstrBot-v4.11+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
+[![GitHub license](https://img.shields.io/github/license/yourusername/astrbot_plugin_debounce?style=flat-square)](LICENSE)
+[![AstrBot](https://img.shields.io/badge/AstrBot-v4.5+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
 **使用 BERT 模型智能判断用户是否说完一句话，减少不必要的 LLM 调用**
 
@@ -202,7 +202,7 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 
 **A**: 修改 `send_threshold`：
 - 值越大越严格（需要更高的完整概率）
-- 建议范围：0.4 - 0.7
+- 建议范围：0.8 - 0.9
 
 ### Q4: 插件会影响性能吗？
 
@@ -215,6 +215,137 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 - **禁用时**：不取消回复，新消息会作为独立消息处理
 
 建议保持启用，以获得更好的对话体验。
+
+---
+
+## 🔄 取消消息机制详解
+
+当启用 `cancel_on_new_message` 时，插件会在 LLM 处理期间检测新消息，并智能取消过时的回复。
+
+### 工作原理
+
+#### 核心钩子
+
+插件使用三个 AstrBot 事件钩子协同工作：
+
+| 钩子 | 执行时机 | 作用 |
+|------|----------|------|
+| `on_will_llm_request` | session lock **之前** | 检测新消息到达，标记旧响应需丢弃 |
+| `on_llm_request` | session lock **之后** | BERT 判断完整性，管理缓冲区 |
+| `on_llm_response` | LLM 响应返回后 | 检查是否需要丢弃响应 |
+
+#### 关键时序
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  消息1: "小面包小面包"                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  T1: on_will_llm_request(消息1)                                  │
+│      → 无旧任务，跳过                                             │
+│                                                                 │
+│  T2: on_llm_request(消息1)                                       │
+│      → BERT 判断: 0.04 (未完整)                                   │
+│      → buffer = ["小面包小面包"]                                  │
+│      → event.stop_event() 阻止发送                               │
+│      → 启动 30秒 监控任务                                         │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 3秒后
+┌─────────────────────────────────────────────────────────────────┐
+│  消息2: "我想你了"                                               │
+├─────────────────────────────────────────────────────────────────┤
+│  T3: on_will_llm_request(消息2)                                  │
+│      → 取消监控任务 ✅                                            │
+│                                                                 │
+│  T4: on_llm_request(消息2)                                       │
+│      → 检测到 waiting_sessions 有消息1                            │
+│      → buffer = ["小面包小面包", "我想你了"]                       │
+│      → BERT 判断: 0.97 (完整)                                     │
+│      → req.prompt = "小面包小面包 我想你了"                        │
+│      → pending_llm_sessions["session"] = "小面包小面包 我想你了"   │
+│      → 发送 LLM 请求 🚀                                           │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 2秒后 (LLM 还在处理中)
+┌─────────────────────────────────────────────────────────────────┐
+│  消息3: "想和你聊聊天"                                           │
+├─────────────────────────────────────────────────────────────────┤
+│  T5: on_will_llm_request(消息3) ⚡ 在 session lock 之前执行！      │
+│      → 检测到 pending_llm_sessions 有正在处理的请求               │
+│      → discard_responses.add("session") 标记丢弃 🎯              │
+│      → 恢复 "小面包小面包 我想你了" 到 buffer                      │
+│      → buffer = ["小面包小面包 我想你了"]                          │
+│                                                                 │
+│  T6: [被 session lock 阻塞，等待消息2的LLM完成...]                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ 8秒后 (LLM 处理完成)
+┌─────────────────────────────────────────────────────────────────┐
+│  消息2 的 LLM 响应返回                                           │
+├─────────────────────────────────────────────────────────────────┤
+│  T7: on_llm_response(消息2的响应)                                 │
+│      → 检测到 discard_responses 包含此会话                        │
+│      → event.stop_event() 丢弃响应 🚫                            │
+│      → 用户看不到这个过时的回复 ✅                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓ session lock 释放
+┌─────────────────────────────────────────────────────────────────┐
+│  消息3 继续处理                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  T8: on_llm_request(消息3)                                       │
+│      → buffer = ["小面包小面包 我想你了", "想和你聊聊天"]          │
+│      → BERT 判断: 0.95 (完整)                                     │
+│      → req.prompt = "小面包小面包 我想你了 想和你聊聊天"           │
+│      → 发送 LLM 请求 🚀                                           │
+│                                                                 │
+│  T9: on_llm_response(消息3的响应)                                 │
+│      → 正常返回 ✅                                                │
+│      → 用户看到完整的回复 🎉                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 为什么需要 `on_will_llm_request`？
+
+AstrBot 使用 **session lock** 防止同一会话的并发 LLM 请求。这意味着：
+
+```
+消息2 正在调用 LLM
+    ↓
+消息3 到达
+    ↓
+消息3 的 on_llm_request 被 session lock 阻塞
+    ↓
+等待消息2 的 LLM 完成后才能执行
+    ↓
+此时检测"新消息"已经太晚了！
+```
+
+**解决方案**：`on_will_llm_request` 钩子在 **session lock 之前** 执行，让我们能在第一时间检测到新消息并标记旧响应需要丢弃。
+
+### 状态管理
+
+| 状态集合 | 类型 | 作用 |
+|----------|------|------|
+| `buffers` | `Dict[session_id, MessageBuffer]` | 存储未完成的消息 |
+| `waiting_sessions` | `Set[session_id]` | 标记正在等待更多消息的会话 |
+| `pending_llm_sessions` | `Dict[session_id, message_text]` | 记录正在处理 LLM 的会话及其消息 |
+| `discard_responses` | `Set[session_id]` | 标记需要丢弃响应的会话 |
+| `monitor_tasks` | `Dict[session_id, Task]` | 超时监控任务 |
+| `skip_debounce_msg_ids` | `Set[msg_id]` | 跳过防抖的伪造消息 ID |
+
+### 消息恢复机制
+
+当旧响应被取消时，插件会将原消息内容恢复到 buffer：
+
+```python
+# 在 on_will_llm_request 中
+if session_id in self.pending_llm_sessions:
+    old_message = self.pending_llm_sessions[session_id]  # "小面包 我想你了"
+    self.discard_responses.add(session_id)
+    
+    # 恢复到 buffer，与新消息合并
+    buffer.messages.insert(0, old_message)
+    # buffer 变为 ["小面包 我想你了", "想和你聊聊天"]
+```
+
+这确保用户发送的所有内容都不会丢失。
 
 ---
 
@@ -233,4 +364,3 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 **如果这个插件对你有帮助，欢迎给个 ⭐ Star！**
 
 </div>
-
