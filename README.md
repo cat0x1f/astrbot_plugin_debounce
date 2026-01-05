@@ -2,9 +2,9 @@
 
 <div align="center">
 
-[![GitHub stars](https://img.shields.io/github/stars/yourusername/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
-[![GitHub license](https://img.shields.io/github/license/yourusername/astrbot_plugin_debounce?style=flat-square)](LICENSE)
-[![AstrBot](https://img.shields.io/badge/AstrBot-v4.5+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
+[![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
+[![GitHub license](https://img.shields.io/github/license/advent259141/astrbot_plugin_debounce?style=flat-square)](LICENSE)
+[![AstrBot](https://img.shields.io/badge/AstrBot-v4.11+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
 **使用 BERT 模型智能判断用户是否说完一句话，减少不必要的 LLM 调用**
 
@@ -233,3 +233,4 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 **如果这个插件对你有帮助，欢迎给个 ⭐ Star！**
 
 </div>
+
