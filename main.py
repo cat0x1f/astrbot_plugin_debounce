@@ -345,6 +345,12 @@ class DebouncePlugin(Star):
             else:
                 # 还是不完整，阻止当前消息
                 event.stop_event()
+                
+                # 重新启动监控任务（因为之前的任务在 on_waiting_llm_request 中被取消了）
+                if session_id not in self.monitor_tasks:
+                    task = asyncio.create_task(self._monitor_session(session_id, timeout_seconds))
+                    self.monitor_tasks[session_id] = task
+                    logger.debug(f"[Debounce] 重新启动监控任务: {session_id}")
                 return
         
         # 首次收到消息，添加到buffer
