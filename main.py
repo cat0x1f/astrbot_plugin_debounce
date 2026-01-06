@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.star import StarTools
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api import logger, AstrBotConfig
 
 
@@ -264,6 +264,7 @@ class DebouncePlugin(Star):
         if session_id in self.pending_llm_sessions:
             old_message = self.pending_llm_sessions[session_id]
             self.discard_responses.add(session_id)
+            logger.debug(f"[Debounce] 标记旧响应需要丢弃: {session_id}, 旧消息: {old_message[:50]if old_message else 'None'}...")
             
             # 恢复被取消的消息到buffer，以便和新消息合并
             buffer = self._get_buffer(session_id)
@@ -271,8 +272,7 @@ class DebouncePlugin(Star):
                 buffer.messages.insert(0, old_message)  # 插入到开头
                 buffer.last_update = time.time()
                 self.waiting_sessions.add(session_id)  # 标记为等待状态
-                logger.debug(f"[Debounce] 恢复被取消的消息到buffer: {old_message}")
-            logger.debug(f"[Debounce] 标记旧响应需要丢弃: {session_id}")
+                logger.debug(f"[Debounce] 恢复被取消的消息到buffer: {old_message[:50]}...")
     
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -332,6 +332,9 @@ class DebouncePlugin(Star):
                 # 清除等待标记
                 self.waiting_sessions.discard(session_id)
                 
+                # 清除可能存在的丢弃标记（防止被错误丢弃）
+                self.discard_responses.discard(session_id)
+                
                 # 修改 ProviderRequest 的 prompt 为合并后的完整文本
                 req.prompt = full_text
                 logger.debug(f"[Debounce] 合并消息发送: {full_text}")
@@ -365,6 +368,8 @@ class DebouncePlugin(Star):
         if is_complete:
             # 完整，清空buffer，让消息通过
             buffer.clear()
+            # 清除可能存在的丢弃标记（防止被错误丢弃）
+            self.discard_responses.discard(session_id)
             # 标记该会话正在处理 LLM 请求，并记录消息内容
             self.pending_llm_sessions[session_id] = message_text
             return
@@ -380,9 +385,11 @@ class DebouncePlugin(Star):
             return
     
     @filter.on_llm_response()
-    async def on_llm_response(self, event: AstrMessageEvent, resp):
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """LLM 响应后的钩子 - 用于取消过时的响应"""
         session_id = event.message_obj.session_id
+        
+        logger.debug(f"[Debounce] LLM响应到达: {session_id}, 是否需要丢弃: {session_id in self.discard_responses}")
         
         # 检查是否需要丢弃这个回复
         if session_id in self.discard_responses:
@@ -390,8 +397,8 @@ class DebouncePlugin(Star):
             self.pending_llm_sessions.pop(session_id, None)
             logger.debug(f"已丢弃过时的 LLM 回复: {session_id}")
             
-            # 阻止回复发送 - 停止事件传播
-            event.stop_event()
+            # 输出空文本而不是阻止事件传播
+            resp.completion_text = ""
             return
         
         # 清除待处理标记
