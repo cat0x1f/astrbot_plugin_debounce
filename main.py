@@ -251,6 +251,14 @@ class DebouncePlugin(Star):
         if not self.config.get("enabled", True):
             return
         
+        # 检查使用场景
+        usage_scope = self.config.get("usage_scope", "both")
+        is_private = event.is_private_chat()
+        if usage_scope == "group" and is_private:
+            return
+        if usage_scope == "private" and not is_private:
+            return
+        
         session_id = event.message_obj.session_id
         msg_id = event.message_obj.message_id
         
@@ -290,6 +298,14 @@ class DebouncePlugin(Star):
         
         # 检查是否启用
         if not self.config.get("enabled", True):
+            return
+        
+        # 检查使用场景
+        usage_scope = self.config.get("usage_scope", "both")
+        is_private = event.is_private_chat()
+        if usage_scope == "group" and is_private:
+            return
+        if usage_scope == "private" and not is_private:
             return
         
         session_id = event.message_obj.session_id
@@ -442,6 +458,14 @@ class DebouncePlugin(Star):
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """LLM 响应后的钩子 - 用于丢弃过时的响应"""
+        # 检查使用场景
+        usage_scope = self.config.get("usage_scope", "both")
+        is_private = event.is_private_chat()
+        if usage_scope == "group" and is_private:
+            return
+        if usage_scope == "private" and not is_private:
+            return
+        
         session_id = event.message_obj.session_id
         
         # 检查是否需要丢弃这个回复

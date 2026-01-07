@@ -24,6 +24,13 @@
         "default": true,
         "hint": "关闭后插件将不拦截任何消息"
     },
+    "usage_scope": {
+        "type": "string",
+        "description": "使用场景",
+        "options": ["both", "group", "private"],
+        "default": "both",
+        "hint": "both: 群聊和私聊都使用 | group: 仅群聊使用 | private: 仅私聊使用"
+    },
     "cancel_on_new_message": {
         "type": "bool",
         "description": "LLM 回复前收到新消息时取消回复",
