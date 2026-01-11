@@ -568,13 +568,26 @@ class DebouncePlugin(Star):
             from astrbot.core.star.star_tools import StarTools
             from astrbot.core.message.components import Plain
             
+            # 保留原始消息的富文本组件(图片、表情等)
+            # 只替换文本部分,保留其他富文本元素
+            original_message = original_event.message_obj.message
+            new_message_components = []
+            
+            # 遍历原始消息组件,保留非Plain类型的组件(如图片、表情等)
+            for component in original_message:
+                if not isinstance(component, Plain):
+                    new_message_components.append(component)
+            
+            # 在开头添加合并后的文本
+            new_message_components.insert(0, Plain(message_text))
+            
             # 创建新消息对象
             new_message = await StarTools.create_message(
                 type=str(original_event.message_obj.type.value),
                 self_id=original_event.get_self_id(),
                 session_id=original_event.session_id,
                 sender=original_event.message_obj.sender,
-                message=[Plain(message_text)],
+                message=new_message_components,
                 message_str=message_text,
                 group_id=original_event.get_group_id() or ""
             )
