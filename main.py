@@ -612,6 +612,7 @@ class DebouncePlugin(Star):
                 sender=original_event.message_obj.sender,
                 message=new_message_components,
                 message_str=message_text,
+                message_id=original_event.message_obj.message_id,
                 group_id=original_event.get_group_id() or ""
             )
             
