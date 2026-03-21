@@ -112,9 +112,14 @@ class DebouncePlugin(Star):
         
         # 正在处理LLM请求的会话集合
         self.pending_llm_sessions: set = set()
-        
-        # 需要丢弃下一个响应的会话集合（简化：只需要标记，不需要计数）
-        self.discard_next_response: set = set()
+
+        # 需要丢弃响应的会话计数 {session_id: count}
+        # 每当新消息在 LLM 处理中到达，计数+1；每个响应被丢弃后-1
+        self.discard_response_count: Dict[str, int] = {}
+
+        # 正在处理LLM的会话对应的 event 引用 {session_id: event}
+        # 用于在新消息到达时直接中止正在运行的 agent（包括流式输出）
+        self.active_llm_events: Dict[str, AstrMessageEvent] = {}
         
         # 正在等待session lock的消息ID {session_id: msg_id}
         self.waiting_msg_ids: Dict[str, str] = {}
@@ -283,14 +288,16 @@ class DebouncePlugin(Star):
             del self.monitor_tasks[session_id]
             logger.debug(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
         
-        # 如果之前的请求还在处理中，标记需要丢弃其响应
+        # 如果之前的请求还在处理中，中止它并标记丢弃
         if session_id in self.pending_llm_sessions:
-            self.discard_next_response.add(session_id)
-            logger.debug(f"[Debounce] 新消息到达，标记旧LLM响应需要丢弃: {session_id}")
-            
-            # 恢复消息到buffer（保证内容完整）
-            buffer = self._get_buffer(session_id)
-            # 注意：不需要恢复消息内容，因为buffer中已经有等待的消息了
+            self.discard_response_count[session_id] = self.discard_response_count.get(session_id, 0) + 1
+            logger.debug(f"[Debounce] 新消息到达，标记旧LLM响应需要丢弃: {session_id}, 待丢弃数: {self.discard_response_count[session_id]}")
+
+            # 直接中止正在运行的 agent（流式和非流式均有效）
+            active_event = self.active_llm_events.get(session_id)
+            if active_event is not None:
+                active_event.set_extra("agent_stop_requested", True)
+                logger.debug(f"[Debounce] 已请求中止正在运行的 agent: {session_id}")
     
     @filter.on_llm_request(priority=100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -350,6 +357,7 @@ class DebouncePlugin(Star):
             self.skip_debounce_msg_ids.remove(msg_id)
             # 标记正在处理LLM请求
             self.pending_llm_sessions.add(session_id)
+            self.active_llm_events[session_id] = event
             logger.debug(f"[Debounce] 伪造消息直接通过: {session_id}")
             return
         
@@ -365,31 +373,38 @@ class DebouncePlugin(Star):
             buffer.add(message_text, event)
             logger.debug(f"消息已添加到缓冲区: {session_id}, buffer消息数: {len(buffer.messages)}")
             
-            # 优化：如果buffer中有多条消息（说明有被取消的消息），直接发送
+            # 如果buffer中有多条消息，仍然进行完整性判断
             if len(buffer.messages) > 1:
                 # 取消监控任务
                 if session_id in self.monitor_tasks:
                     self.monitor_tasks[session_id].cancel()
                     del self.monitor_tasks[session_id]
-                
-                # 清除等待标记
-                self.waiting_sessions.discard(session_id)
-                
-                # 直接发送合并消息
+
                 full_text = buffer.get_full_text()
-                req.prompt = full_text
-                logger.debug(f"[Debounce] 多条消息合并直接发送（跳过判断）: {full_text}")
-                
-                # 注意：不清空buffer！等LLM成功响应后再清空
-                # 因为在响应前可能还有新消息到达,需要全部合并
-                
-                # 注意：不清除discard标记！因为旧的LLM响应可能还在路上
-                # 旧响应到达时会检测到discard标记并被丢弃
-                
-                # 标记该会话正在处理新的 LLM 请求
-                self.pending_llm_sessions.add(session_id)
-                return
-            
+                score_send, _ = await self.classifier.predict(full_text)
+                is_complete = score_send >= threshold
+                logger.debug(f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'} (多条消息合并)")
+
+                if is_complete:
+                    # 清除等待标记
+                    self.waiting_sessions.discard(session_id)
+
+                    req.prompt = full_text
+                    logger.debug(f"[Debounce] 多条消息合并发送: {full_text}")
+
+                    # 标记该会话正在处理新的 LLM 请求
+                    self.pending_llm_sessions.add(session_id)
+                    self.active_llm_events[session_id] = event
+                    return
+                else:
+                    # 还不完整，继续等待
+                    event.stop_event()
+                    if session_id not in self.monitor_tasks:
+                        task = asyncio.create_task(self._monitor_session(session_id, timeout_seconds))
+                        self.monitor_tasks[session_id] = task
+                        logger.debug(f"[Debounce] 多条消息仍不完整，重启监控任务: {session_id}")
+                    return
+
             # 只有一条消息，需要判断完整性
             full_text = buffer.get_full_text()
             score_send, _ = await self.classifier.predict(full_text)
@@ -410,12 +425,10 @@ class DebouncePlugin(Star):
                 logger.debug(f"[Debounce] 合并消息发送: {full_text}")
                 
                 # 注意：不清空buffer！等LLM成功响应后再清空
-                
-                # 清除丢弃标记（这是新的请求，不应该被丢弃）
-                self.discard_next_response.discard(session_id)
-                
+
                 # 标记该会话正在处理新的 LLM 请求
                 self.pending_llm_sessions.add(session_id)
+                self.active_llm_events[session_id] = event
                 return  # 让这条消息正常发送
             else:
                 # 还是不完整，阻止当前消息
@@ -439,10 +452,9 @@ class DebouncePlugin(Star):
         
         if is_complete:
             # 完整，让消息通过（不清空buffer,等LLM响应后清空）
-            # 清除丢弃标记（这是新的请求，不应该被丢弃）
-            self.discard_next_response.discard(session_id)
             # 标记该会话正在处理 LLM 请求
             self.pending_llm_sessions.add(session_id)
+            self.active_llm_events[session_id] = event
             return
         else:
             # 不完整，阻止发送，启动监控任务
@@ -467,21 +479,31 @@ class DebouncePlugin(Star):
             return
         
         session_id = event.message_obj.session_id
-        
-        # 检查是否需要丢弃这个回复
-        if session_id in self.discard_next_response:
-            logger.debug(f"[Debounce] 已丢弃过时的 LLM 回复: {session_id}")
-            # 输出空文本
-            resp.completion_text = ""
+
+        # 检查是否需要丢弃这个回复（计数器 > 0 说明有更新的消息已到达）
+        discard_count = self.discard_response_count.get(session_id, 0)
+        if discard_count > 0:
+            logger.debug(f"[Debounce] 已丢弃过时的 LLM 回复: {session_id}, 剩余待丢弃: {discard_count - 1}")
+            # resp 可能为 None（agent 在生成回复前就被中止）
+            if resp is not None:
+                resp.completion_text = ""
+            event.stop_event()  # 阻止 RespondStage 发送消息
+            # 计数-1
+            if discard_count <= 1:
+                del self.discard_response_count[session_id]
+            else:
+                self.discard_response_count[session_id] = discard_count - 1
+            # 标记为等待状态，让下一条消息进入 should_merge 路径并正确合并
+            self.waiting_sessions.add(session_id)
         else:
             # 只有成功的响应才清空buffer
             if session_id in self.buffers:
                 self.buffers[session_id].clear()
                 logger.debug(f"[Debounce] LLM响应成功,清空buffer: {session_id}")
-        
+
         # 清除待处理标记(无论是否丢弃,这个LLM会话都已结束)
         self.pending_llm_sessions.discard(session_id)
-        self.discard_next_response.discard(session_id)
+        self.active_llm_events.pop(session_id, None)
     
     async def _timeout_checker(self):
         """后台任务：定期清理过期的缓冲区"""
@@ -513,7 +535,8 @@ class DebouncePlugin(Star):
         
         self.buffers.clear()
         self.pending_llm_sessions.clear()
-        self.discard_next_response.clear()
+        self.discard_response_count.clear()
+        self.active_llm_events.clear()
         self.skip_debounce_msg_ids.clear()
         self.waiting_sessions.clear()
         self.waiting_msg_ids.clear()
@@ -594,13 +617,39 @@ class DebouncePlugin(Star):
             
             # 标记这个消息需要跳过防抖
             self.skip_debounce_msg_ids.add(new_message.message_id)
-            
+
             # 伪造事件并提交
-            await StarTools.create_event(
-                abm=new_message,
-                platform=original_event.get_platform_name(),
-                is_wake=True
-            )
+            platform_name = original_event.get_platform_name()
+            if platform_name == "aiocqhttp":
+                await StarTools.create_event(
+                    abm=new_message,
+                    platform=platform_name,
+                    is_wake=True
+                )
+            else:
+                # 对其他平台，直接复用原始事件的类型和适配器
+                platform_adapters = self.context.platform_manager.get_insts()
+                adapter = next(
+                    (p for p in platform_adapters if p.meta().name == platform_name),
+                    None
+                )
+                if adapter is None:
+                    raise ValueError(f"未找到平台适配器: {platform_name}")
+                # 获取适配器的客户端引用（不同平台字段名不同）
+                platform_client = getattr(adapter, 'client', None) or getattr(adapter, 'bot', None)
+                if platform_client is None:
+                    raise ValueError(f"无法获取平台 {platform_name} 的客户端引用")
+                # 用原始事件同类型构造新事件（构造器第5个位置参数为 bot/client）
+                event_cls = type(original_event)
+                new_event = event_cls(
+                    message_text,
+                    new_message,
+                    adapter.meta(),
+                    new_message.session_id,
+                    platform_client,
+                )
+                new_event.is_wake = True
+                adapter.commit_event(new_event)
             
             logger.debug(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
             
