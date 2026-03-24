@@ -113,9 +113,9 @@ class DebouncePlugin(Star):
         # 正在处理LLM请求的会话集合
         self.pending_llm_sessions: set = set()
 
-        # 需要丢弃响应的会话计数 {session_id: count}
-        # 每当新消息在 LLM 处理中到达，计数+1；每个响应被丢弃后-1
-        self.discard_response_count: Dict[str, int] = {}
+        # 需要丢弃当前活跃响应的会话集合
+        # AstrBot 同一 session 同时只会有一个活跃 LLM 请求，所以这里用 set 即可
+        self.discard_pending_responses: set = set()
 
         # 正在处理LLM的会话对应的 event 引用 {session_id: event}
         # 用于在新消息到达时直接中止正在运行的 agent（包括流式输出）
@@ -273,8 +273,10 @@ class DebouncePlugin(Star):
             logger.debug(f"[Debounce] 检测到伪造消息（跳过状态检查）: {session_id}")
             return
         
+        cancel_on_new_message = self.config.get("cancel_on_new_message", True)
+
         # 如果该session有消息正在等待锁，取消它（只处理最新的消息）
-        if session_id in self.waiting_msg_ids:
+        if cancel_on_new_message and session_id in self.waiting_msg_ids:
             old_msg_id = self.waiting_msg_ids[session_id]
             self.should_cancel_msg_ids.add(old_msg_id)
             logger.debug(f"[Debounce] 标记前一个等待中的消息应被取消: {session_id}, msg_id: {old_msg_id}")
@@ -289,9 +291,10 @@ class DebouncePlugin(Star):
             logger.debug(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
         
         # 如果之前的请求还在处理中，中止它并标记丢弃
-        if session_id in self.pending_llm_sessions:
-            self.discard_response_count[session_id] = self.discard_response_count.get(session_id, 0) + 1
-            logger.debug(f"[Debounce] 新消息到达，标记旧LLM响应需要丢弃: {session_id}, 待丢弃数: {self.discard_response_count[session_id]}")
+        if cancel_on_new_message and session_id in self.pending_llm_sessions:
+            if session_id not in self.discard_pending_responses:
+                self.discard_pending_responses.add(session_id)
+                logger.debug(f"[Debounce] 新消息到达，标记旧LLM响应需要丢弃: {session_id}")
 
             # 直接中止正在运行的 agent（流式和非流式均有效）
             active_event = self.active_llm_events.get(session_id)
@@ -480,19 +483,14 @@ class DebouncePlugin(Star):
         
         session_id = event.message_obj.session_id
 
-        # 检查是否需要丢弃这个回复（计数器 > 0 说明有更新的消息已到达）
-        discard_count = self.discard_response_count.get(session_id, 0)
-        if discard_count > 0:
-            logger.debug(f"[Debounce] 已丢弃过时的 LLM 回复: {session_id}, 剩余待丢弃: {discard_count - 1}")
+        # 检查是否需要丢弃这个回复（说明当前活跃请求已被更新的消息淘汰）
+        if session_id in self.discard_pending_responses:
+            logger.debug(f"[Debounce] 已丢弃过时的 LLM 回复: {session_id}")
             # resp 可能为 None（agent 在生成回复前就被中止）
             if resp is not None:
                 resp.completion_text = ""
             event.stop_event()  # 阻止 RespondStage 发送消息
-            # 计数-1
-            if discard_count <= 1:
-                del self.discard_response_count[session_id]
-            else:
-                self.discard_response_count[session_id] = discard_count - 1
+            self.discard_pending_responses.discard(session_id)
             # 标记为等待状态，让下一条消息进入 should_merge 路径并正确合并
             self.waiting_sessions.add(session_id)
         else:
@@ -535,7 +533,7 @@ class DebouncePlugin(Star):
         
         self.buffers.clear()
         self.pending_llm_sessions.clear()
-        self.discard_response_count.clear()
+        self.discard_pending_responses.clear()
         self.active_llm_events.clear()
         self.skip_debounce_msg_ids.clear()
         self.waiting_sessions.clear()
